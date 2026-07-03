@@ -1,3 +1,4 @@
 flask
 pyproj
 flask-cors
+shapely
