@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Ортодромия с облётом зон</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0; padding: 20px; background-color: #f5f5f5; color: #333;
+        }
+        .container {
+            max-width: 900px; margin: 0 auto; background: white;
+            padding: 25px 30px; border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h2 { margin-top: 0; color: #2c3e50; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 4px; font-weight: 600; color: #555; }
+        input[type="text"], input[type="number"], select, textarea {
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc;
+            border-radius: 5px; font-size: 14px; box-sizing: border-box;
+        }
+        textarea { resize: vertical; }
+        button {
+            background-color: #3498db; color: white; border: none;
+            padding: 10px 25px; border-radius: 5px; font-size: 16px;
+            cursor: pointer; margin-top: 5px; margin-right: 10px;
+        }
+        button:hover { background-color: #2980b9; }
+        .btn-danger { background-color: #e74c3c; }
+        .btn-danger:hover { background-color: #c0392b; }
+        #map { height: 500px; margin-top: 20px; border-radius: 8px; border: 1px solid #ddd; }
+        .error input, .error select { border-color: #e74c3c; background-color: #fff5f5; }
+        .error-message { color: #e74c3c; font-size: 12px; margin-top: 4px; }
+        #error-container { margin-top: 10px; }
+        .zone-list { margin-top: 10px; }
+        .zone-list-item { background: #f0f0f0; padding: 5px; margin: 3px 0; border-radius: 3px; font-size: 13px; }
+        .legend {
+            background: white; padding: 8px 12px; border-radius: 4px;
+            box-shadow: 0 0 5px rgba(0,0,0,0.2); font-size: 13px; line-height: 1.6;
+        }
+        .legend i {
+            width: 15px; height: 15px; display: inline-block; margin-right: 5px;
+            border-radius: 2px; vertical-align: middle;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Построение ортодромии с облётом зон</h2>
+
+        <div class="form-group" id="group-point1">
+            <label>Начальная точка (WKT POINT)</label>
+            <input type="text" id="point1" value="POINT(37.512817382812 55.75)" placeholder="POINT(lon lat)">
+        </div>
+        <div class="form-group" id="group-point2">
+            <label>Конечная точка (WKT POINT)</label>
+            <input type="text" id="point2" value="POINT(160.76293945312 55.75)" placeholder="POINT(lon lat)">
+        </div>
+        <div class="form-group" id="group-cs">
+            <label>Система координат</label>
+            <select id="cs">
+                <option value="4326">WGS84 (EPSG:4326)</option>
+                <option value="4284">СК-42 (EPSG:4284)</option>
+                <option value="3857">Web Mercator (EPSG:3857)</option>
+            </select>
+        </div>
+        <div class="form-group" id="group-count">
+            <label>Количество точек в линии</label>
+            <input type="number" id="count" value="30" min="3" max="100" step="1">
+        </div>
+
+        <div class="form-group">
+            <label>Зона запрета (EWKT)</label>
+            <textarea id="ewkt-input" rows="2" placeholder="SRID=4326;POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))"></textarea>
+            <button id="add-zone-btn">Добавить зону</button>
+        </div>
+
+        <div class="zone-list" id="zone-list">
+            <strong>Добавленные зоны:</strong>
+        </div>
+        <button id="clear-zones-btn" class="btn-danger" style="margin-top:10px;">Удалить все зоны</button>
+
+        <div id="error-container"></div>
+        <button onclick="buildOrthodrome()">Построить линию</button>
+
+        <div class="legend" style="margin-top: 15px;">
+            <div><i style="background:#2980b9;"></i> Безопасный участок</div>
+            <div><i style="background:#27ae60;"></i> Облёт между зонами</div>
+            <div><i style="background:#e74c3c;"></i> Внутри зоны (нарушение)</div>
+            <div><i style="border: 2px solid #27ae60; background:transparent;"></i> Облёт (меньшая часть зоны)</div>
+        </div>
+
+        <div id="map"></div>
+    </div>
+
+    <script>
+        var map = L.map('map').setView([55.75, 97.0], 3);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        var drawnZones = [];
+        var zonesMapLayer = L.layerGroup().addTo(map);
+        var outlineLayer = L.layerGroup().addTo(map);
+        var resultLayer = L.layerGroup().addTo(map);
+
+        function parseEWKTPolygon(ewkt) {
+            var sridMatch = ewkt.match(/SRID=(\d+);/i);
+            if (!sridMatch) throw new Error('Отсутствует SRID');
+            var srid = parseInt(sridMatch[1]);
+            var polyMatch = ewkt.match(/POLYGON\s*\(\(\s*(.*?)\s*\)\)/i);
+            if (!polyMatch) throw new Error('Не найден POLYGON');
+            var coordsText = polyMatch[1];
+            var pointStrings = coordsText.split(',');
+            var latlngs = [];
+            for (var i = 0; i < pointStrings.length; i++) {
+                var pair = pointStrings[i].trim().split(/\s+/);
+                if (pair.length !== 2) throw new Error('Координаты должны быть парами: lon lat');
+                var lon = parseFloat(pair[0]);
+                var lat = parseFloat(pair[1]);
+                if (isNaN(lon) || isNaN(lat)) throw new Error('Некорректные числа');
+                latlngs.push([lat, lon]);
+            }
+            return latlngs;
+        }
+
+        function addZoneToMap(ewkt) {
+            try {
+                var latlngs = parseEWKTPolygon(ewkt);
+                L.polygon(latlngs, {
+                    color: '#c0392b',
+                    weight: 2,
+                    fillOpacity: 0.15,
+                    fillColor: '#e74c3c'
+                }).addTo(zonesMapLayer);
+            } catch(e) {
+                alert('Ошибка разбора зоны: ' + e.message);
+                return false;
+            }
+            return true;
+        }
+
+        function renderZoneList() {
+            var listEl = document.getElementById('zone-list');
+            listEl.innerHTML = '<strong>Добавленные зоны:</strong>';
+            if (drawnZones.length === 0) {
+                listEl.innerHTML += ' <em>нет</em>';
+                return;
+            }
+            drawnZones.forEach(function(zone, idx) {
+                listEl.innerHTML += '<div class="zone-list-item">' + (idx+1) + '. ' + zone + '</div>';
+            });
+        }
+
+        document.getElementById('add-zone-btn').addEventListener('click', function() {
+            var ewkt = document.getElementById('ewkt-input').value.trim();
+            if (!ewkt) {
+                alert('Введите EWKT-строку полигона');
+                return;
+            }
+            if (!/^SRID=\d+;POLYGON\s*\(\(/.test(ewkt)) {
+                alert('Неверный формат EWKT. Пример: SRID=4326;POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))');
+                return;
+            }
+            if (!addZoneToMap(ewkt)) return;
+            drawnZones.push(ewkt);
+            document.getElementById('ewkt-input').value = '';
+            renderZoneList();
+        });
+
+        document.getElementById('clear-zones-btn').addEventListener('click', function() {
+            drawnZones = [];
+            zonesMapLayer.clearLayers();
+            outlineLayer.clearLayers();
+            resultLayer.clearLayers();
+            renderZoneList();
+        });
+
+        function clearErrors() {
+            document.querySelectorAll('.form-group').forEach(g => g.classList.remove('error'));
+            document.getElementById('error-container').innerHTML = '';
+        }
+
+        function showError(groupId, message) {
+            const group = document.getElementById(groupId);
+            if (group) group.classList.add('error');
+            document.getElementById('error-container').innerHTML += `<div class="error-message">${message}</div>`;
+        }
+
+        async function buildOrthodrome() {
+            clearErrors();
+            const point1Str = document.getElementById('point1').value.trim();
+            const point2Str = document.getElementById('point2').value.trim();
+            const cs = parseInt(document.getElementById('cs').value);
+            const count = parseInt(document.getElementById('count').value);
+
+            const wktRegex = /^\s*POINT\s*\(\s*([-\d.]+)[,\s]+([-\d.]+)\s*\)\s*$/i;
+            let hasError = false;
+
+            if (!wktRegex.test(point1Str)) {
+                showError('group-point1', 'Неверный формат начальной точки');
+                hasError = true;
+            }
+            if (!wktRegex.test(point2Str)) {
+                showError('group-point2', 'Неверный формат конечной точки');
+                hasError = true;
+            }
+            if (isNaN(count) || count < 2 || !Number.isInteger(count)) {
+                showError('group-count', 'Количество точек должно быть целым числом ≥ 2');
+                hasError = true;
+            }
+            if (hasError) return;
+
+            const m1 = wktRegex.exec(point1Str);
+            const m2 = wktRegex.exec(point2Str);
+            const lat1 = parseFloat(m1[2]), lon1 = parseFloat(m1[1]);
+            const lat2 = parseFloat(m2[2]), lon2 = parseFloat(m2[1]);
+            if (cs === 4326 || cs === 4284) {
+                if (lat1 < -90 || lat1 > 90 || lat2 < -90 || lat2 > 90) {
+                    showError('group-point1', 'Широта должна быть от -90 до 90°');
+                    showError('group-point2', 'Широта должна быть от -90 до 90°');
+                    hasError = true;
+                }
+                if (lon1 < -180 || lon1 > 180 || lon2 < -180 || lon2 > 180) {
+                    showError('group-point1', 'Долгота должна быть от -180 до 180°');
+                    showError('group-point2', 'Долгота должна быть от -180 до 180°');
+                    hasError = true;
+                }
+            }
+            if (hasError) return;
+
+            const payload = {
+                point1: point1Str,
+                point2: point2Str,
+                cs: cs,
+                count: count,
+                zones: drawnZones
+            };
+
+            try {
+                const response = await fetch('http://127.0.0.1:5000/api/orthodrome', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!response.ok) {
+                    const err = await response.json();
+                    showError('group-point1', 'Ошибка сервера: ' + (err.error || response.status));
+                    return;
+                }
+                const data = await response.json();
+
+                // Очищаем предыдущие результаты
+                resultLayer.clearLayers();
+                outlineLayer.clearLayers();
+
+                // Сначала рисуем зелёный контур (он будет под линией)
+                if (data.outlines && data.outlines.length > 0) {
+                    data.outlines.forEach(function(ring) {
+                        var latlngs = ring.map(function(c) { return [c[1], c[0]]; });
+                        L.polygon(latlngs, {
+                            color: '#27ae60',
+                            weight: 3,
+                            fill: false
+                        }).addTo(outlineLayer);
+                    });
+                }
+
+                // Затем рисуем линию (она будет поверх контура)
+                if (data.type === 'FeatureCollection') {
+                    L.geoJSON(data, {
+                        style: function(feature) {
+                            var color = feature.properties.color;
+                            var style = { weight: 5 };
+                            if (color === 'red') style.color = '#e74c3c';
+                            else if (color === 'green') style.color = '#27ae60';
+                            else style.color = '#2980b9';
+                            return style;
+                        }
+                    }).addTo(resultLayer);
+                } else {
+                    L.geoJSON(data, {
+                        style: { color: '#2980b9', weight: 5 }
+                    }).addTo(resultLayer);
+                }
+
+                // Поднимаем линию наверх, чтобы красная часть перекрыла зелёный контур
+                resultLayer.bringToFront();
+
+                if (resultLayer.getBounds().isValid()) {
+                    map.fitBounds(resultLayer.getBounds(), { padding: [30, 30] });
+                }
+            } catch (err) {
+                showError('group-point1', 'Ошибка соединения с сервером. Проверьте, запущен ли он.');
+                console.error(err);
+            }
+        }
+
+        renderZoneList();
+    </script>
+</body>
+</html>
